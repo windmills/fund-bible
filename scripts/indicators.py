@@ -646,6 +646,300 @@ def format_signals(signals):
     return '\n'.join(lines)
 
 
+# ============================================================
+# 自适应分析框架（v2.0 新增）
+# ============================================================
+
+def detect_regime(closes):
+    if len(closes) < 65:
+        return {"trend": "unknown", "trend_strength": "weak",
+                "volatility": "unknown", "vol_factor": 1.0,
+                "adx": 0, "price_vs_ma60": 0, "ma60_slope": 0, "ann_vol": 0}
+
+    r = calc_all(closes)
+    ann_vol = r.get('ann_volatility') or 0
+    ma60 = r.get('ma60') or 0
+    ma20 = r.get('ma20') or 0
+    nav = closes[-1]
+    adx = r.get('adx') or 0
+
+    if ann_vol > 30:
+        vol_regime = "high"
+        vol_factor = round(ann_vol / 25, 2)
+    elif ann_vol < 20:
+        vol_regime = "low"
+        vol_factor = 0.8
+    else:
+        vol_regime = "medium"
+        vol_factor = 1.0
+
+    ma60_5d = sum(closes[-65:-5]) / 60
+    ma60_slope = (ma60 - ma60_5d) / ma60_5d * 100 if ma60_5d > 0 else 0
+    price_vs_ma60 = (nav - ma60) / ma60 * 100 if ma60 > 0 else 0
+
+    if price_vs_ma60 > 5 and ma60_slope > 0:
+        trend = "strong_up"
+    elif price_vs_ma60 > 0 and ma60_slope >= 0:
+        trend = "up"
+    elif price_vs_ma60 < -5 and ma60_slope < 0:
+        trend = "strong_down"
+    elif price_vs_ma60 < 0 and ma60_slope <= 0:
+        trend = "down"
+    else:
+        trend = "sideways"
+
+    if adx > 25:
+        trend_strength = "strong"
+    elif adx > 20:
+        trend_strength = "moderate"
+    else:
+        trend_strength = "weak"
+
+    return {
+        "trend": trend,
+        "trend_strength": trend_strength,
+        "volatility": vol_regime,
+        "vol_factor": vol_factor,
+        "adx": round(adx, 1),
+        "price_vs_ma60": round(price_vs_ma60, 1),
+        "ma60_slope": round(ma60_slope, 2),
+        "ann_vol": round(ann_vol, 1),
+    }
+
+
+def backtest_signals(closes, lookback=30, horizon=3):
+    if len(closes) < lookback + horizon + 70:
+        lookback = max(30, len(closes) - horizon - 70)
+    start = max(len(closes) - lookback - horizon, 70)
+    end = len(closes) - horizon
+    signal_stats = {}
+
+    for i in range(start, end):
+        day_closes = closes[:i + 1]
+        if len(day_closes) < 70:
+            continue
+        r = calc_all(day_closes)
+        sigs = scan_signals(r)
+        dt = detect_double_top(day_closes)
+        if dt and dt[0] == "forming":
+            sigs.append(("铁律1", "sell", 20, "双顶"))
+        elif dt and dt[0] == "confirmed":
+            sigs.append(("铁律1", "sell", 30, "双顶确认"))
+
+        fwd_ret = (closes[i + horizon] - day_closes[-1]) / day_closes[-1] * 100
+
+        for sig_id, direction, weight, desc in sigs:
+            if sig_id not in signal_stats:
+                signal_stats[sig_id] = {
+                    "triggered": 0, "correct": 0, "total_return": 0.0,
+                    "direction": direction, "descriptions": []
+                }
+            signal_stats[sig_id]["triggered"] += 1
+            signal_stats[sig_id]["total_return"] += fwd_ret
+            signal_stats[sig_id]["descriptions"].append(desc)
+            is_buy = direction == "buy"
+            if (is_buy and fwd_ret > 0) or (not is_buy and fwd_ret < 0):
+                signal_stats[sig_id]["correct"] += 1
+
+    results = {}
+    for sig_id, stats in signal_stats.items():
+        n = stats["triggered"]
+        if n < 2:
+            wm = 1.0
+            acc = None
+        else:
+            acc = stats["correct"] / n
+            avg_ret = stats["total_return"] / n
+            if acc >= 0.65:
+                wm = 1.5
+            elif acc >= 0.55:
+                wm = 1.0
+            elif acc >= 0.45:
+                wm = 0.7
+            else:
+                wm = 0.3
+        results[sig_id] = {
+            "accuracy": round(acc * 100, 1) if acc is not None else None,
+            "avg_return": round(stats["total_return"] / n, 2) if n > 0 else 0,
+            "triggered": n,
+            "weight_multiplier": wm,
+            "direction": stats["direction"],
+        }
+
+    return results
+
+
+def adaptive_scan(results, backtest_stats, regime):
+    base_signals = scan_signals(results)
+    vol_factor = regime.get("vol_factor", 1.0)
+    trend = regime.get("trend", "sideways")
+    trend_strength = regime.get("trend_strength", "weak")
+
+    if trend == "strong_up":
+        sell_trend_factor, buy_trend_factor = 0.3, 1.0
+    elif trend == "up":
+        sell_trend_factor, buy_trend_factor = 0.7, 1.0
+    elif trend == "strong_down":
+        sell_trend_factor, buy_trend_factor = 1.0, 0.3
+    elif trend == "down":
+        sell_trend_factor, buy_trend_factor = 1.0, 0.7
+    else:
+        sell_trend_factor, buy_trend_factor = 1.0, 1.0
+
+    nav = results.get("nav", 0)
+    bias6 = results.get("bias6")
+    wr14 = results.get("wr14")
+    cci = results.get("cci")
+    kdj_k = results.get("kdj_k")
+
+    adapted = []
+    adjustments = []
+
+    for sig_id, direction, weight, desc in base_signals:
+        orig_w = weight
+        reasons = []
+
+        if direction == "sell":
+            weight *= sell_trend_factor
+            if sell_trend_factor != 1.0:
+                reasons.append(f"趋势{trend}×{sell_trend_factor}")
+        else:
+            weight *= buy_trend_factor
+            if buy_trend_factor != 1.0:
+                reasons.append(f"趋势{trend}×{buy_trend_factor}")
+
+        if sig_id in ("TR-9", "TR-10") and trend_strength == "weak":
+            weight *= 0.3
+            reasons.append("ADX弱趋势SAR×0.3")
+
+        if sig_id in backtest_stats:
+            bt = backtest_stats[sig_id]
+            wm = bt["weight_multiplier"]
+            weight *= wm
+            if wm != 1.0:
+                acc_str = f"{bt['accuracy']:.0f}%" if bt['accuracy'] else "?"
+                reasons.append(f"回测{acc_str}×{wm}")
+
+        weight = round(weight)
+
+        adapted.append((sig_id, direction, weight, desc))
+        if reasons:
+            adjustments.append((sig_id, orig_w, weight, " | ".join(reasons)))
+
+    return adapted, adjustments
+
+
+def detect_double_top_adaptive(closes, regime):
+    dt = detect_double_top(closes)
+    if not dt:
+        return None
+
+    status, peak_a, peak_b, neckline, pct_diff = dt
+
+    if regime.get("trend") == "strong_up":
+        if regime.get("price_vs_ma60", 0) > 10:
+            return ("observation", peak_a, peak_b, neckline, pct_diff,
+                    "强上升趋势中双顶降级为观察（价格远超MA60，可能为上涨中继）")
+
+    return (status, peak_a, peak_b, neckline, pct_diff, "")
+
+
+def format_regime(regime):
+    trend_map = {
+        "strong_up": "🟢 强上升趋势", "up": "🟢 上升趋势",
+        "sideways": "🟡 震荡", "down": "🔴 下降趋势",
+        "strong_down": "🔴 强下降趋势", "unknown": "⚪ 未知"
+    }
+    vol_map = {"high": "🔴 高波动", "medium": "🟡 中波动",
+               "low": "🟢 低波动", "unknown": "⚪ 未知"}
+    strength_map = {"strong": "强(ADX>25)", "moderate": "中(ADX20-25)",
+                    "weak": "弱(ADX<20)"}
+
+    lines = []
+    lines.append("【市场状态识别】")
+    lines.append(f"  趋势: {trend_map.get(regime['trend'], '?')}")
+    lines.append(f"  趋势强度: {strength_map.get(regime['trend_strength'], '?')} (ADX={regime['adx']})")
+    lines.append(f"  波动率: {vol_map.get(regime['volatility'], '?')} (年化{regime['ann_vol']}%)")
+    lines.append(f"  波动系数: ×{regime['vol_factor']}")
+    lines.append(f"  价偏MA60: {regime['price_vs_ma60']}%")
+    lines.append(f"  MA60斜率: {regime['ma60_slope']}%/5日")
+    if regime['trend'] in ('strong_up', 'strong_down'):
+        lines.append(f"  ⚡ 强趋势模式: {'卖出信号×0.3(抑制恐慌), 买入信号正常' if regime['trend']=='strong_up' else '买入信号×0.3(不接飞刀), 卖出信号正常'}")
+    if regime['trend_strength'] == 'weak':
+        lines.append(f"  ⚡ 弱趋势模式: SAR信号×0.3（ADX<20时SAR不可靠）")
+    return '\n'.join(lines)
+
+
+def format_backtest(bt_stats):
+    if not bt_stats:
+        return "【回测校准】\n  (数据不足，无法回测)"
+
+    valid = {k: v for k, v in bt_stats.items() if v['accuracy'] is not None}
+    if not valid:
+        return "【回测校准】\n  (触发次数不足，使用默认权重)"
+
+    sorted_sigs = sorted(valid.items(), key=lambda x: x[1]['accuracy'])
+
+    lines = []
+    lines.append("【回测校准】")
+    lines.append(f"  回测窗口: 近{max(v['triggered'] for v in valid.values())}次触发, 3日前瞻")
+
+    lines.append("  📊 信号准确率排行:")
+    for sig_id, stats in sorted_sigs:
+        acc = stats['accuracy']
+        avg = stats['avg_return']
+        n = stats['triggered']
+        wm = stats['weight_multiplier']
+        direction = "买" if stats['direction'] == 'buy' else "卖"
+        mark = "⚠️" if acc < 45 else "✅" if acc >= 65 else "  "
+        lines.append(f"    {mark} {sig_id:<10} {direction} {acc:>5.1f}% 均{avg:>+6.2f}% x{n} → 权重×{wm}")
+
+    dangerous = [(k, v) for k, v in sorted_sigs if v['accuracy'] < 45]
+    if dangerous:
+        lines.append(f"  ⚠️ 危险信号(准确率<45%): {', '.join(k for k,_ in dangerous)}")
+
+    reliable = [(k, v) for k, v in sorted_sigs if v['accuracy'] >= 65]
+    if reliable:
+        lines.append(f"  ✅ 可靠信号(准确率≥65%): {', '.join(k for k,_ in reliable)}")
+
+    return '\n'.join(lines)
+
+
+def format_adaptive_signals(signals, adjustments):
+    buy_sigs = [(s[0], s[3], s[2]) for s in signals if s[1] == "buy"]
+    sell_sigs = [(s[0], s[3], s[2]) for s in signals if s[1] == "sell"]
+    buy_weight = sum(s[2] for s in signals if s[1] == "buy")
+    sell_weight = sum(s[2] for s in signals if s[1] == "sell")
+    net = buy_weight - sell_weight
+
+    lines = []
+    lines.append("【自适应信号扫描】")
+    lines.append(f"  买入信号: {len(buy_sigs)}条 (权重合计 {buy_weight})")
+    for sid, desc, w in sorted(buy_sigs, key=lambda x: -x[2]):
+        adj = next((f" [原{oa}→{na}]" for s, oa, na, r in adjustments if s == sid), "")
+        lines.append(f"    +{sid} [权重{w}]{adj} {desc}")
+    lines.append(f"  卖出信号: {len(sell_sigs)}条 (权重合计 {sell_weight})")
+    for sid, desc, w in sorted(sell_sigs, key=lambda x: -x[2]):
+        adj = next((f" [原{oa}→{na}]" for s, oa, na, r in adjustments if s == sid), "")
+        lines.append(f"    -{sid} [权重{w}]{adj} {desc}")
+
+    lines.append(f"  多空力量: 买{buy_weight} vs 卖{sell_weight} → 净分{net}")
+
+    if net > 15:
+        action = "买入/加仓"
+    elif net > 0:
+        action = "持有偏多"
+    elif net > -15:
+        action = "持有偏空"
+    elif net > -30:
+        action = "减仓"
+    else:
+        action = "清仓"
+    lines.append(f"  操作建议: {action}")
+
+    return '\n'.join(lines)
+
+
 def main():
     code = None
     navs_raw = None
@@ -694,23 +988,45 @@ def main():
     output = format_output(results, date_str, fund_name)
     print(output)
 
-    signals = scan_signals(results)
+    # ===== 自适应分析框架 v2.0 =====
 
-    dt = detect_double_top(closes)
-    if dt:
-        status, peak_a, peak_b, neckline, pct_diff = dt
+    # ① 市场状态识别
+    regime = detect_regime(closes)
+    print(format_regime(regime))
+    print()
+
+    # ② 回测校准
+    lookback = 30 if regime.get('volatility') == 'high' else 60
+    bt_stats = backtest_signals(closes, lookback=lookback, horizon=3)
+    print(format_backtest(bt_stats))
+    print()
+
+    # ③ 自适应信号扫描
+    adapted_signals, adjustments = adaptive_scan(results, bt_stats, regime)
+
+    # ④ 自适应双顶检测
+    dt_adaptive = detect_double_top_adaptive(closes, regime)
+    if dt_adaptive:
+        status, peak_a, peak_b, neckline, pct_diff, note = dt_adaptive
         if status == "forming":
-            signals.append(("铁律1", "sell", 20,
-                f"双顶形成中: 高点A={peak_a:.4f} vs 高点B={peak_b:.4f} (差{pct_diff:.2f}%), 颈线={neckline:.4f} → 必须减仓50%"))
-            print(f"\n⚠️ 铁律1 警告: 双顶形成中!")
-            print(f"   高点A={peak_a:.4f}  高点B={peak_b:.4f}  差距={pct_diff:.2f}%")
-            print(f"   颈线={neckline:.4f}  (跌破颈线=清仓)")
+            adapted_signals.append(("铁律1", "sell", 20,
+                f"双顶形成中: A={peak_a:.4f} B={peak_b:.4f} 差{pct_diff:.2f}% 颈线={neckline:.4f}"))
+            print(f"⚠️ 铁律1: 双顶形成中  A={peak_a:.4f} B={peak_b:.4f} 颈线={neckline:.4f}")
+            if note:
+                print(f"   💡 {note}")
+        elif status == "observation":
+            adapted_signals.append(("铁律1-观察", "sell", 5,
+                f"双顶(降级观察): A={peak_a:.4f} B={peak_b:.4f} 颈线={neckline:.4f}"))
+            print(f"💡 铁律1(观察): 双顶形态存在但在强上升趋势中降级")
+            print(f"   A={peak_a:.4f} B={peak_b:.4f} 颈线={neckline:.4f}")
+            print(f"   {note}")
         elif status == "confirmed":
-            signals.append(("铁律1", "sell", 30,
-                f"双顶已确认: 颈线{neckline:.4f}已跌破 → 立即清仓!"))
+            adapted_signals.append(("铁律1", "sell", 30,
+                f"双顶已确认: 颈线{neckline:.4f}已跌破 → 清仓!"))
+            print(f"🚨 铁律1: 双顶已确认! 颈线{neckline:.4f}跌破 → 清仓!")
 
-    print("【自动信号扫描】")
-    print(format_signals(signals))
+    print()
+    print(format_adaptive_signals(adapted_signals, adjustments))
 
 if __name__ == '__main__':
     main()
